@@ -64,9 +64,16 @@ app.post("/chat", async (req, res) => {
     "Current booking context: " + asText(booking),
   ].join("\n\n");
 
+  const recentHistory = history.filter((item) => item && ["user", "assistant"].includes(item.role));
+  const lastHistoryMessage = recentHistory[recentHistory.length - 1];
+  const historyToSend = lastHistoryMessage &&
+    lastHistoryMessage.role === "user" &&
+    asText(lastHistoryMessage.content || lastHistoryMessage.text).trim() === message
+      ? recentHistory.slice(0, -1)
+      : recentHistory;
+
   const contents = [
-    ...history
-      .filter((item) => item && ["user", "assistant"].includes(item.role))
+    ...historyToSend
       .map((item) => ({
         role: item.role === "assistant" ? "model" : "user",
         parts: [{ text: asText(item.content || item.text).slice(0, 5000) }],
