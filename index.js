@@ -4,7 +4,7 @@ import cors from "cors";
 const app = express();
 const PORT = process.env.PORT || 3001;
 const API_KEY = process.env.GEMINI_API_KEY;
-const MODEL = process.env.GEMINI_MODEL || "gemini-2.5-flash";
+const MODEL = process.env.GEMINI_MODEL || "gemini-3.8-flash";
 
 const allowedOrigins = (process.env.FRONTEND_URL || "https://nela-frontend1.onrender.com")
   .split(",")
