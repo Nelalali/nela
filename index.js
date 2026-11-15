@@ -130,6 +130,54 @@ app.post("/chat", async (req, res) => {
   }
 });
 
+
+app.post("/support", async (req, res) => {
+  if (!API_KEY) {
+    return res.status(503).json({ error: "AI_NOT_CONFIGURED", answer: "Η υπηρεσία AI υποστήριξης δεν είναι διαθέσιμη αυτή τη στιγμή." });
+  }
+  const message = String(req.body?.message || "").trim();
+  if (!message) return res.status(400).json({ error: "MESSAGE_REQUIRED" });
+  if (message.length > 3000) return res.status(413).json({ error: "MESSAGE_TOO_LONG" });
+  const history = Array.isArray(req.body?.history) ? req.body.history.slice(-10) : [];
+  const systemInstruction = [
+    "You are NELA Support, the helpful AI product-support assistant inside the NELA Business Studio dashboard.",
+    "Reply in the same language as the latest user message. Use natural modern Greek for Greek messages.",
+    "Help business owners understand the NELA dashboard: overview, bookings, calendar, cancellations, clients, analytics, services, settings, and basic troubleshooting.",
+    "Be warm, professional, concise, and give clear step-by-step instructions when useful.",
+    "You cannot access or change the user's account, bookings, settings, subscription, or files. Never claim that you performed an action or inspected their data.",
+    "Never ask for passwords, API keys, payment card details, or other sensitive credentials. If a user reports a technical issue you cannot resolve, explain that a human NELA support representative may need to review it.",
+    "Do not invent product features, integrations, prices, policies, or capabilities. If unsure, say so plainly.",
+  ].join("\n\n");
+  const validHistory = history.filter(item => item && ["user","assistant"].includes(item.role) && (item.content || item.text));
+  const last = validHistory[validHistory.length - 1];
+  const previous = last && last.role === "user" && asText(last.content || last.text).trim() === message ? validHistory.slice(0,-1) : validHistory;
+  const contents = [
+    ...previous.map(item => ({ role: item.role === "assistant" ? "model" : "user", parts: [{ text: asText(item.content || item.text).slice(0,2500) }] })),
+    { role: "user", parts: [{ text: message }] },
+  ];
+  try {
+    const url = new URL(`https://generativelanguage.googleapis.com/v1beta/models/${encodeURIComponent(MODEL)}:generateContent`);
+    url.searchParams.set("key", API_KEY);
+    const upstream = await fetch(url, {
+      method: "POST",
+      headers: { "Content-Type": "application/json" },
+      body: JSON.stringify({ systemInstruction: { parts: [{ text: systemInstruction }] }, contents, generationConfig: { temperature: 0.55, maxOutputTokens: 700 } }),
+      signal: AbortSignal.timeout(30000),
+    });
+    const payload = await upstream.json().catch(() => ({}));
+    if (!upstream.ok) {
+      console.error("Gemini support error:", upstream.status, payload?.error?.message || "Unknown error");
+      return res.status(502).json({ error: "AI_PROVIDER_ERROR", answer: "Δεν μπόρεσα να συνδεθώ με την υποστήριξη AI. Δοκίμασε ξανά σε λίγο." });
+    }
+    const answer = payload?.candidates?.[0]?.content?.parts?.map(part => part.text || "").join("\n").trim();
+    if (!answer) return res.status(502).json({ error: "EMPTY_AI_RESPONSE", answer: "Δεν έλαβα απάντηση. Μπορείς να δοκιμάσεις ξανά;" });
+    return res.json({ answer });
+  } catch (error) {
+    console.error("NELA support request failed:", error?.message || error);
+    return res.status(504).json({ error: "AI_REQUEST_FAILED", answer: "Η σύνδεση με την υποστήριξη καθυστέρησε. Δοκίμασε ξανά." });
+  }
+});
+
 app.listen(PORT, () => {
   console.log(`NELA AI backend listening on port ${PORT}`);
 });
