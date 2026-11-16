@@ -22,8 +22,9 @@ app.use(express.json({ limit: "1mb" }));
 app.get("/", (_req, res) => res.json({ service: "NELA AI", status: "online" }));
 app.get("/health", (_req, res) => res.json({
   status: "ok",
-  aiConfigured: Boolean(API_KEY),
-  model: MODEL,
+  aiConfigured: configuredProviders().length > 0,
+  providers: configuredProviders().map(({ name, model }) => ({ name, model })),
+  providerCount: configuredProviders().length,
 }));
 
 function asText(value) {
@@ -32,14 +33,101 @@ function asText(value) {
   try { return JSON.stringify(value); } catch { return String(value); }
 }
 
-app.post("/chat", async (req, res) => {
-  if (!API_KEY) {
-    return res.status(503).json({
-      error: "AI_NOT_CONFIGURED",
-      answer: "Η NELA δεν έχει συνδεθεί ακόμη με το AI. Παρακαλώ δοκιμάστε ξανά σύντομα.",
-    });
+function configuredProviders() {
+  return [
+    { name: "Gemini", key: process.env.GEMINI_API_KEY, model: process.env.GEMINI_MODEL || "gemini-3.8-flash" },
+    { name: "OpenAI", key: process.env.OPENAI_API_KEY, model: process.env.OPENAI_MODEL || "gpt-5-mini" },
+    { name: "Claude", key: process.env.ANTHROPIC_API_KEY, model: process.env.ANTHROPIC_MODEL || "claude-sonnet-4-5" },
+  ].filter((provider) => Boolean(provider.key));
+}
+
+async function generateWithFallback({ systemInstruction, contents, temperature = 0.6, maxOutputTokens = 800 }) {
+  const providers = configuredProviders();
+  const failures = [];
+
+  for (const provider of providers) {
+    try {
+      const messages = contents.map((item) => ({
+        role: item.role === "model" ? "assistant" : "user",
+        content: (item.parts || []).map((part) => part.text || "").join("\\n"),
+      }));
+
+      let answer = "";
+
+      if (provider.name === "Gemini") {
+        const url = new URL(`https://generativelanguage.googleapis.com/v1beta/models/${encodeURIComponent(provider.model)}:generateContent`);
+        url.searchParams.set("key", provider.key);
+        const response = await fetch(url, {
+          method: "POST",
+          headers: { "Content-Type": "application/json" },
+          body: JSON.stringify({
+            systemInstruction: { parts: [{ text: systemInstruction }] },
+            contents,
+            generationConfig: { temperature, maxOutputTokens },
+          }),
+          signal: AbortSignal.timeout(25000),
+        });
+        const payload = await response.json().catch(() => ({}));
+        if (!response.ok) throw new Error(`HTTP ${response.status}: ${payload?.error?.message || "Gemini request failed"}`);
+        answer = payload?.candidates?.[0]?.content?.parts?.map((part) => part.text || "").join("\\n").trim();
+      }
+
+      if (provider.name === "OpenAI") {
+        const response = await fetch("https://api.openai.com/v1/responses", {
+          method: "POST",
+          headers: { "Content-Type": "application/json", Authorization: `Bearer ${provider.key}` },
+          body: JSON.stringify({
+            model: provider.model,
+            instructions: systemInstruction,
+            input: messages,
+            temperature,
+            max_output_tokens: maxOutputTokens,
+          }),
+          signal: AbortSignal.timeout(25000),
+        });
+        const payload = await response.json().catch(() => ({}));
+        if (!response.ok) throw new Error(`HTTP ${response.status}: ${payload?.error?.message || "OpenAI request failed"}`);
+        answer = payload?.output_text || payload?.output?.flatMap((item) => item.content || []).filter((item) => item.type === "output_text").map((item) => item.text).join("\\n").trim();
+      }
+
+      if (provider.name === "Claude") {
+        const response = await fetch("https://api.anthropic.com/v1/messages", {
+          method: "POST",
+          headers: {
+            "Content-Type": "application/json",
+            "x-api-key": provider.key,
+            "anthropic-version": "2023-06-01",
+          },
+          body: JSON.stringify({
+            model: provider.model,
+            system: systemInstruction,
+            messages,
+            temperature,
+            max_tokens: maxOutputTokens,
+          }),
+          signal: AbortSignal.timeout(25000),
+        });
+        const payload = await response.json().catch(() => ({}));
+        if (!response.ok) throw new Error(`HTTP ${response.status}: ${payload?.error?.message || "Claude request failed"}`);
+        answer = payload?.content?.filter((item) => item.type === "text").map((item) => item.text).join("\\n").trim();
+      }
+
+      if (answer) return { answer, provider: provider.name, model: provider.model };
+      throw new Error("Provider returned an empty response.");
+    } catch (error) {
+      failures.push(`${provider.name}: ${error?.message || "request failed"}`);
+      console.error(`NELA ${provider.name} provider failed:`, error?.message || error);
+    }
   }
 
+  const error = new Error(providers.length
+    ? `All configured AI providers failed. ${failures.join(" | ")}`
+    : "No AI provider API keys are configured.");
+  error.code = providers.length ? "ALL_AI_PROVIDERS_FAILED" : "AI_NOT_CONFIGURED";
+  throw error;
+}
+
+app.post("/chat", async (req, res) => {
   const message = String(req.body?.message || "").trim();
   if (!message) return res.status(400).json({ error: "MESSAGE_REQUIRED" });
   if (message.length > 6000) return res.status(413).json({ error: "MESSAGE_TOO_LONG" });
@@ -82,59 +170,24 @@ app.post("/chat", async (req, res) => {
   ];
 
   try {
-    const url = new URL(`https://generativelanguage.googleapis.com/v1beta/models/${encodeURIComponent(MODEL)}:generateContent`);
-    url.searchParams.set("key", API_KEY);
-
-    const upstream = await fetch(url, {
-      method: "POST",
-      headers: { "Content-Type": "application/json" },
-      body: JSON.stringify({
-        systemInstruction: { parts: [{ text: systemInstruction }] },
-        contents,
-        generationConfig: {
-          temperature: 0.65,
-          maxOutputTokens: 900,
-        },
-      }),
-      signal: AbortSignal.timeout(30000),
+    const result = await generateWithFallback({
+      systemInstruction,
+      contents,
+      temperature: 0.65,
+      maxOutputTokens: 900,
     });
-
-    const payload = await upstream.json().catch(() => ({}));
-    if (!upstream.ok) {
-      console.error("Gemini API error:", upstream.status, payload?.error?.message || "Unknown error");
-      return res.status(502).json({
-        error: "AI_PROVIDER_ERROR",
-        answer: "Δεν μπόρεσα να συνδεθώ με την υπηρεσία AI αυτή τη στιγμή. Δοκιμάστε ξανά σε λίγο.",
-      });
-    }
-
-    const answer = payload?.candidates?.[0]?.content?.parts
-      ?.map((part) => part.text || "")
-      .join("\n")
-      .trim();
-
-    if (!answer) {
-      return res.status(502).json({
-        error: "EMPTY_AI_RESPONSE",
-        answer: "Δεν έλαβα ολοκληρωμένη απάντηση. Μπορείτε να δοκιμάσετε ξανά;",
-      });
-    }
-
-    return res.json({ answer });
+    return res.json({ answer: result.answer, provider: result.provider });
   } catch (error) {
-    console.error("NELA AI request failed:", error?.message || error);
-    return res.status(504).json({
-      error: "AI_REQUEST_FAILED",
-      answer: "Η σύνδεση με το AI καθυστέρησε. Παρακαλώ δοκιμάστε ξανά.",
+    console.error("NELA AI fallback chain failed:", error?.message || error);
+    return res.status(error.code === "AI_NOT_CONFIGURED" ? 503 : 502).json({
+      error: error.code || "AI_PROVIDERS_FAILED",
+      answer: "Η NELA δεν μπόρεσε να συνδεθεί με κανέναν από τους διαθέσιμους AI παρόχους αυτή τη στιγμή. Παρακαλώ δοκιμάστε ξανά σε λίγο.",
     });
   }
 });
 
 
 app.post("/support", async (req, res) => {
-  if (!API_KEY) {
-    return res.status(503).json({ error: "AI_NOT_CONFIGURED", answer: "Η υπηρεσία AI υποστήριξης δεν είναι διαθέσιμη αυτή τη στιγμή." });
-  }
   const message = String(req.body?.message || "").trim();
   if (!message) return res.status(400).json({ error: "MESSAGE_REQUIRED" });
   if (message.length > 3000) return res.status(413).json({ error: "MESSAGE_TOO_LONG" });
@@ -156,25 +209,19 @@ app.post("/support", async (req, res) => {
     { role: "user", parts: [{ text: message }] },
   ];
   try {
-    const url = new URL(`https://generativelanguage.googleapis.com/v1beta/models/${encodeURIComponent(MODEL)}:generateContent`);
-    url.searchParams.set("key", API_KEY);
-    const upstream = await fetch(url, {
-      method: "POST",
-      headers: { "Content-Type": "application/json" },
-      body: JSON.stringify({ systemInstruction: { parts: [{ text: systemInstruction }] }, contents, generationConfig: { temperature: 0.55, maxOutputTokens: 700 } }),
-      signal: AbortSignal.timeout(30000),
+    const result = await generateWithFallback({
+      systemInstruction,
+      contents,
+      temperature: 0.55,
+      maxOutputTokens: 700,
     });
-    const payload = await upstream.json().catch(() => ({}));
-    if (!upstream.ok) {
-      console.error("Gemini support error:", upstream.status, payload?.error?.message || "Unknown error");
-      return res.status(502).json({ error: "AI_PROVIDER_ERROR", answer: "Δεν μπόρεσα να συνδεθώ με την υποστήριξη AI. Δοκίμασε ξανά σε λίγο." });
-    }
-    const answer = payload?.candidates?.[0]?.content?.parts?.map(part => part.text || "").join("\n").trim();
-    if (!answer) return res.status(502).json({ error: "EMPTY_AI_RESPONSE", answer: "Δεν έλαβα απάντηση. Μπορείς να δοκιμάσεις ξανά;" });
-    return res.json({ answer });
+    return res.json({ answer: result.answer, provider: result.provider });
   } catch (error) {
-    console.error("NELA support request failed:", error?.message || error);
-    return res.status(504).json({ error: "AI_REQUEST_FAILED", answer: "Η σύνδεση με την υποστήριξη καθυστέρησε. Δοκίμασε ξανά." });
+    console.error("NELA support fallback chain failed:", error?.message || error);
+    return res.status(error.code === "AI_NOT_CONFIGURED" ? 503 : 502).json({
+      error: error.code || "AI_PROVIDERS_FAILED",
+      answer: "Η υποστήριξη της NELA δεν μπόρεσε να συνδεθεί με AI αυτή τη στιγμή. Δοκίμασε ξανά σε λίγο.",
+    });
   }
 });
 
